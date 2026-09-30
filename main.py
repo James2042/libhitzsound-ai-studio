@@ -1,6 +1,8 @@
 from pathlib import Path
+import subprocess
 import uuid
 import zipfile
+import logging
 
 import librosa
 import numpy as np
@@ -11,12 +13,21 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 
-app = FastAPI(title="LibHitzSound AI Studio")
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("libhitzsound-ai")
 
 
+app = FastAPI(
+    title="LibHitzSound AI Studio",
+    version="0.1.0"
+)
+
+
+# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -24,12 +35,12 @@ app.add_middleware(
 
 BASE = Path(__file__).parent
 OUT = BASE / "outputs"
-OUT.mkdir(exist_ok=True)
+OUT.mkdir(parents=True, exist_ok=True)
 
 
 app.mount(
     "/outputs",
-    StaticFiles(directory=OUT),
+    StaticFiles(directory=str(OUT)),
     name="outputs"
 )
 
@@ -47,15 +58,16 @@ def create_midi(path, notes, tempo):
         initial_tempo=max(float(tempo), 1.0)
     )
 
-    instrument = pretty_midi.Instrument(
-        program=0
-    )
+    instrument = pretty_midi.Instrument(program=0)
 
     for start, end, pitch, velocity in notes:
+        if end <= start:
+            continue
+
         instrument.notes.append(
             pretty_midi.Note(
-                velocity=int(velocity),
-                pitch=int(pitch),
+                velocity=int(max(1, min(127, velocity))),
+                pitch=int(max(0, min(127, pitch))),
                 start=float(start),
                 end=float(end)
             )
@@ -63,6 +75,42 @@ def create_midi(path, notes, tempo):
 
     midi.instruments.append(instrument)
     midi.write(str(path))
+
+
+def convert_to_wav(input_path, output_path):
+    """
+    Convert any supported audio format to a standard WAV file.
+    FFmpeg is installed by the Dockerfile.
+    """
+
+    command = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(input_path),
+        "-vn",
+        "-ac",
+        "1",
+        "-ar",
+        "44100",
+        "-sample_fmt",
+        "s16",
+        str(output_path)
+    ]
+
+    result = subprocess.run(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True
+    )
+
+    if result.returncode != 0:
+        logger.error("FFmpeg error: %s", result.stderr)
+
+        raise RuntimeError(
+            "FFmpeg could not decode the uploaded audio file."
+        )
 
 
 @app.post("/api/beat-analyze")
@@ -73,23 +121,27 @@ async def analyze_beat(
     if not file.filename:
         raise HTTPException(
             status_code=400,
-            detail="No audio file."
+            detail="No audio file was uploaded."
         )
 
-    allowed = [
+    allowed = {
         ".mp3",
         ".wav",
         ".m4a",
         ".flac",
-        ".ogg"
-    ]
+        ".ogg",
+        ".aac"
+    }
 
     ext = Path(file.filename).suffix.lower()
 
     if ext not in allowed:
         raise HTTPException(
             status_code=400,
-            detail="Unsupported audio format."
+            detail=(
+                "Unsupported audio format. "
+                "Use MP3, WAV, M4A, FLAC, OGG, or AAC."
+            )
         )
 
     job = uuid.uuid4().hex
@@ -100,62 +152,113 @@ async def analyze_beat(
         exist_ok=True
     )
 
-    audio_path = folder / (
-        "audio" + ext
+    original_path = folder / (
+        "original" + ext
     )
 
-    audio_data = await file.read()
-
-    with open(audio_path, "wb") as audio_file:
-        audio_file.write(audio_data)
+    wav_path = folder / "analysis.wav"
 
     try:
 
+        # Save upload
+        audio_data = await file.read()
+
+        if not audio_data:
+            raise HTTPException(
+                status_code=400,
+                detail="The uploaded audio file is empty."
+            )
+
+        with open(original_path, "wb") as audio_file:
+            audio_file.write(audio_data)
+
+        logger.info(
+            "Received audio: %s (%d bytes)",
+            file.filename,
+            len(audio_data)
+        )
+
+        # Convert audio through FFmpeg
+        convert_to_wav(
+            original_path,
+            wav_path
+        )
+
+        # Load converted WAV
         y, sr = librosa.load(
-            str(audio_path),
-            sr=None,
+            str(wav_path),
+            sr=44100,
             mono=True
         )
 
-        if len(y) == 0:
-            raise Exception(
-                "The audio file contains no readable audio."
+        if y is None or len(y) == 0:
+            raise RuntimeError(
+                "The audio contains no readable samples."
             )
 
-        tempo_result, beat_frames = (
-            librosa.beat.beat_track(
+        duration = float(
+            librosa.get_duration(
                 y=y,
                 sr=sr
             )
+        )
+
+        if duration < 0.5:
+            raise RuntimeError(
+                "The audio is too short to analyze."
+            )
+
+        logger.info(
+            "Audio loaded successfully: %.2f seconds, %d Hz",
+            duration,
+            sr
+        )
+
+        # BPM
+        tempo_result, beat_frames = librosa.beat.beat_track(
+            y=y,
+            sr=sr
         )
 
         tempo_array = np.asarray(
             tempo_result
         ).reshape(-1)
 
-        if len(tempo_array) == 0:
-            tempo = 120.0
+        if len(tempo_array) > 0:
+            tempo = float(tempo_array[0])
         else:
-            tempo = float(
-                tempo_array[0]
+            tempo = 120.0
+
+        if not np.isfinite(tempo) or tempo <= 0:
+            tempo = 120.0
+
+        tempo = min(max(tempo, 40.0), 240.0)
+
+        # Key detection
+        try:
+            chroma = librosa.feature.chroma_cqt(
+                y=y,
+                sr=sr
             )
 
-        if tempo <= 0:
-            tempo = 120.0
+            chroma_average = np.mean(
+                chroma,
+                axis=1
+            )
 
-        chroma = librosa.feature.chroma_cqt(
-            y=y,
-            sr=sr
-        )
+            root = int(
+                np.argmax(chroma_average)
+            )
 
-        chroma_average = np.mean(
-            chroma,
-            axis=1
-        )
+        except Exception as key_error:
 
-        root = int(
-            np.argmax(chroma_average)
-        )
+            logger.warning(
+                "Key detection failed: %s",
+                key_error
+            )
+
+            # Fall back to C
+            root = 0
 
         keys = [
             "C",
@@ -174,11 +277,6 @@ async def analyze_beat(
 
         key = keys[root]
 
-        duration = librosa.get_duration(
-            y=y,
-            sr=sr
-        )
-
         beat_time = 60.0 / tempo
 
         kick = []
@@ -190,6 +288,7 @@ async def analyze_beat(
         melody = []
         counter_melody = []
 
+        # Generate beat structure
         t = 0.0
 
         while t < duration:
@@ -198,15 +297,17 @@ async def analyze_beat(
                 t / beat_time
             ) % 4
 
+            end_time = min(
+                t + 0.10,
+                duration
+            )
+
             if beat in [0, 2]:
 
                 kick.append(
                     (
                         t,
-                        min(
-                            t + 0.10,
-                            duration
-                        ),
+                        end_time,
                         36,
                         110
                     )
@@ -217,10 +318,7 @@ async def analyze_beat(
                 snare.append(
                     (
                         t,
-                        min(
-                            t + 0.10,
-                            duration
-                        ),
+                        end_time,
                         38,
                         100
                     )
@@ -266,6 +364,7 @@ async def analyze_beat(
 
             t += beat_time
 
+        # Generate musical parts
         t = 0.0
 
         while t < duration:
@@ -311,27 +410,19 @@ async def analyze_beat(
             t += beat_time * 4
 
         parts = {
-
             "Kick.mid": kick,
-
             "Snare.mid": snare,
-
             "HiHat.mid": hihat,
-
             "Percussion.mid": percussion,
-
             "Bass.mid": bass,
-
             "Chords.mid": chords,
-
             "Melody.mid": melody,
-
-            "Counter_Melody.mid":
-                counter_melody
+            "Counter_Melody.mid": counter_melody
         }
 
         created = []
 
+        # Create individual MIDI files
         for name, notes in parts.items():
 
             midi_path = folder / name
@@ -342,20 +433,15 @@ async def analyze_beat(
                 tempo
             )
 
-            created.append(
-                midi_path
-            )
+            created.append(midi_path)
 
-        full_path = (
-            folder / "Full_Beat.mid"
-        )
+        # Full MIDI
+        full_path = folder / "Full_Beat.mid"
 
         all_notes = []
 
         for notes in parts.values():
-            all_notes.extend(
-                notes
-            )
+            all_notes.extend(notes)
 
         create_midi(
             full_path,
@@ -363,14 +449,10 @@ async def analyze_beat(
             tempo
         )
 
-        created.append(
-            full_path
-        )
+        created.append(full_path)
 
-        zip_path = (
-            folder /
-            "LibHitzSound_MIDI_Pack.zip"
-        )
+        # ZIP
+        zip_path = folder / "LibHitzSound_MIDI_Pack.zip"
 
         with zipfile.ZipFile(
             zip_path,
@@ -385,48 +467,50 @@ async def analyze_beat(
                     midi_path.name
                 )
 
+        logger.info(
+            "Analysis completed successfully: %s",
+            file.filename
+        )
+
+        base_url = "/outputs/" + job + "/"
+
         return {
-
             "success": True,
-
             "filename": file.filename,
-
-            "bpm": round(
-                tempo,
-                2
-            ),
-
+            "bpm": round(tempo, 2),
             "key": key,
-
-            "duration_seconds":
-                round(
-                    duration,
-                    2
-                ),
+            "duration_seconds": round(duration, 2),
 
             "midi_files": [
-
-                "/outputs/"
-                + job
-                + "/"
-                + midi_path.name
-
-                for midi_path
-                in created
+                base_url + midi_path.name
+                for midi_path in created
             ],
 
-            "zip":
-                "/outputs/"
-                + job
-                + "/"
-                + "LibHitzSound_MIDI_Pack.zip"
+            "zip": (
+                base_url +
+                "LibHitzSound_MIDI_Pack.zip"
+            )
         }
+
+    except HTTPException:
+        raise
 
     except Exception as error:
 
+        logger.exception(
+            "Beat analysis failed"
+        )
+
         raise HTTPException(
             status_code=500,
-            detail=
-                "Analysis failed: "
-                + str(error)
-            )
+            detail=f"Analysis failed: {str(error)}"
+        )
+
+    finally:
+
+        # Remove temporary WAV after analysis
+        try:
+            if wav_path.exists():
+                wav_path.unlink()
+        except Exception:
+            pass
